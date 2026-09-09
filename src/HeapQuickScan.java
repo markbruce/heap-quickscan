@@ -365,9 +365,7 @@ public class HeapQuickScan {
 
             switch (tag) {
                 case TAG_GC_ROOT_UNKNOWN:
-                case TAG_GC_ROOT_NATIVE_STACK:
                 case TAG_GC_ROOT_STICKY_CLASS:
-                case TAG_GC_ROOT_THREAD_BLOCK:
                 case TAG_GC_ROOT_MONITOR_USED:
                     skipFully(idSize);
                     break;
@@ -378,6 +376,10 @@ public class HeapQuickScan {
                 case TAG_GC_ROOT_JAVA_FRAME:
                 case TAG_GC_ROOT_THREAD_OBJ:
                     skipFully(idSize + 8L);
+                    break;
+                case TAG_GC_ROOT_NATIVE_STACK:
+                case TAG_GC_ROOT_THREAD_BLOCK:
+                    skipFully(idSize + 4L);
                     break;
                 case TAG_CLASS_DUMP:
                     parseClassDump();
@@ -725,7 +727,7 @@ public class HeapQuickScan {
             System.out.println();
             System.out.printf("Classes with instances: %,d%n", classCounts.size());
             System.out.printf("Array types:            %,d%n", arrayStats.size());
-            System.out.printf("Total live instances:   %,d%n", totalInstances);
+            System.out.printf("Total objects:          %,d (instances + arrays)%n", totalInstances);
             System.out.printf("Total shallow size:     %s (estimate)%n", formatSize(totalBytes));
             System.out.println();
         }

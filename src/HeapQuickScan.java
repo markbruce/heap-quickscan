@@ -126,10 +126,35 @@ public class HeapQuickScan {
         long superId;
         int instanceSize;
         int ownRefFields;          // instance fields of type 'object' declared here
+        long[] fieldNames;         // own instance field name string ids (declaration order)
+        byte[] fieldTypes;         // own instance field hprof type codes
     }
     final Map<Long, ClassInfo> classInfos = new HashMap<Long, ClassInfo>();
     final Map<Long, Integer> shallowPerInstance = new HashMap<Long, Integer>(); // resolved lazily
     final Map<Long, Long> classCounts = new HashMap<Long, Long>();      // classId -> instance count
+
+    // ---- GC root / thread attribution (bounded) ----
+    static final int MAX_ROOTS = 2_000_000;
+    static final int MAX_FRAMES = 200_000;
+    static final int MAX_TRACES = 200_000;
+
+    /** A GC root: sub-record tag plus its auxiliary u4s. */
+    static class Root {
+        final int tag;
+        final long a, b;           // THREAD_OBJ: threadSeq, stackSeq; JNI_LOCAL/JAVA_FRAME: threadSeq, frameNum
+        Root(int tag, long a, long b) { this.tag = tag; this.a = a; this.b = b; }
+    }
+    final Map<Long, Root> roots = new HashMap<Long, Root>();       // objectId -> root info
+    final Map<Integer, Long> serialToClass = new HashMap<Integer, Long>(); // LOAD_CLASS serial -> classId
+    final Map<Long, long[]> frames = new HashMap<Long, long[]>();  // frameId -> {nameId, sigId, fileId, classSerial, lineNo}
+    final Map<Integer, long[]> traces = new HashMap<Integer, long[]>(); // traceSerial -> frame ids
+    final Map<Integer, Integer> traceToThreadSerial = new HashMap<Integer, Integer>();
+    final Map<Integer, Integer> threadSerialToTrace = new HashMap<Integer, Integer>();
+    final List<Long> threadObjIds = new ArrayList<Long>();         // THREAD_OBJ-rooted object ids
+    long threadClassId = -1;
+    static int HQS_DBG;
+    final List<long[]> _dbg = new ArrayList<long[]>();
+    int oopsStringVotesCompressed, oopsStringVotesUncompressed;
     // array type display name -> {count, totalBytes}
     final Map<String, long[]> arrayStats = new HashMap<String, long[]>();
 
@@ -168,8 +193,10 @@ public class HeapQuickScan {
     public static void main(String[] args) {
         String command = null;
         String filePath = null;
+        String objectIdArg = null;
         int topN = 20;
         String sort = "bytes";
+        boolean forceUncompressed = false;
 
         for (int i = 0; i < args.length; i++) {
             String a = args[i];
@@ -195,6 +222,8 @@ public class HeapQuickScan {
                 command = a;
             } else if (filePath == null) {
                 filePath = a;
+            } else if (objectIdArg == null) {
+                objectIdArg = a;
             } else {
                 fail("Unexpected argument: " + a);
                 return;
@@ -205,15 +234,21 @@ public class HeapQuickScan {
             printUsage();
             return;
         }
-        if (!command.equals("top-classes") && !command.equals("top-arrays") && !command.equals("summary")) {
+        boolean needsObject = command.equals("paths");
+        if (!command.equals("top-classes") && !command.equals("top-arrays") && !command.equals("summary")
+                && !command.equals("threads") && !needsObject) {
             fail("Unknown command: " + command);
+            return;
+        }
+        if (needsObject && objectIdArg == null) {
+            fail("paths requires an object id, e.g. paths dump.hprof 0x415000000");
             return;
         }
 
         HeapQuickScan scanner = new HeapQuickScan();
-        boolean forceUncompressed = false;
+        boolean forceUncompressedF = false;
         for (String a : args) {
-            if ("--uncompressed-oops".equals(a)) { scanner.uncompressedOops = true; forceUncompressed = true; }
+            if ("--uncompressed-oops".equals(a)) { scanner.uncompressedOops = true; forceUncompressedF = true; }
         }
         try {
             scanner.scan(filePath);
@@ -221,8 +256,32 @@ public class HeapQuickScan {
             fail("Failed to parse " + filePath + " at offset " + scanner.pos() + ": " + e.getMessage());
             return;
         }
-        if (!forceUncompressed) scanner.detectOopsMode();
-        scanner.report(command, topN, sort);
+        if (!forceUncompressedF) scanner.detectOopsMode();
+
+        File dumpFile = new File(filePath);
+        if (command.equals("threads") || needsObject) {
+            try {
+                System.err.println("Resolving thread names...");
+                scanner.resolveThreadNames(dumpFile, scanner.threadNames);
+            } catch (IOException e) {
+                System.err.println("Thread name resolution failed: " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
+        if (command.equals("threads")) {
+            scanner.reportThreads(topN);
+        } else if (needsObject) {
+            long targetId = objectIdArg.toLowerCase().startsWith("0x")
+                    ? Long.parseLong(objectIdArg.substring(2), 16)
+                    : Long.parseLong(objectIdArg);
+            try {
+                scanner.reportPaths(dumpFile, targetId, 30);
+            } catch (IOException e) {
+                fail("Path search failed: " + e.getMessage());
+            }
+        } else {
+            scanner.report(command, topN, sort);
+        }
     }
 
     static void fail(String msg) {
@@ -237,9 +296,12 @@ public class HeapQuickScan {
         System.out.println("Usage: java HeapQuickScan <command> <file.hprof> [options]");
         System.out.println();
         System.out.println("Commands:");
-        System.out.println("  top-classes   List classes by shallow size (or instance count)");
-        System.out.println("  top-arrays    List the largest individual arrays (with object IDs)");
-        System.out.println("  summary       Overview: totals + top classes + top arrays");
+        System.out.println("  summary            Overview: totals + top classes + top arrays");
+        System.out.println("  top-classes        Classes by shallow size (or instance count)");
+        System.out.println("  top-arrays         Largest individual arrays (with object IDs)");
+        System.out.println("  threads            Thread list with names and Java stacks");
+        System.out.println("  paths <objectId>   Shortest reference path from an object to its GC root,");
+        System.out.println("                     with thread attribution (e.g. paths dump.hprof 0x415000000)");
         System.out.println();
         System.out.println("Options:");
         System.out.println("  -n <num>      Number of entries to show (default: 20)");
@@ -287,6 +349,12 @@ public class HeapQuickScan {
                         break;
                     case TAG_LOAD_CLASS:
                         readLoadClassRecord();
+                        break;
+                    case TAG_FRAME:
+                        readFrameRecord();
+                        break;
+                    case TAG_TRACE:
+                        readTraceRecord();
                         break;
                     case TAG_HEAP_DUMP:
                     case TAG_HEAP_DUMP_SEGMENT:
@@ -342,11 +410,15 @@ public class HeapQuickScan {
     }
 
     void readLoadClassRecord() throws IOException {
-        in.readInt();              // class serial number (unused)
+        int classSerial = in.readInt();        // class serial number (frame references use it)
         long classId = readId();
-        in.readInt();              // stack trace serial number (unused)
+        in.readInt();                          // stack trace serial number (unused)
         long strId = readId();
         classNameStrId.put(classId, strId);
+        serialToClass.put(classSerial, classId);
+        if (threadClassId == -1 && "java/lang/Thread".equals(stringTable.get(strId))) {
+            threadClassId = classId;
+        }
         // Names are resolved lazily at report time: STRING records may appear
         // after LOAD_CLASS records in some dumps. The String class id is needed
         // during the scan itself (for oops detection), so resolve it eagerly
@@ -360,26 +432,38 @@ public class HeapQuickScan {
         long segStart = pos();
         long segEnd = segStart + length;
 
+        final boolean dbg = System.getenv("HQS_DEBUG") != null;
         while (pos() < segEnd) {
             int tag = in.readUnsignedByte();
+            if (dbg) System.err.println("MAIN @"+pos()+" 0x"+Integer.toHexString(tag));
 
             switch (tag) {
                 case TAG_GC_ROOT_UNKNOWN:
                 case TAG_GC_ROOT_STICKY_CLASS:
                 case TAG_GC_ROOT_MONITOR_USED:
-                    skipFully(idSize);
+                    recordRoot(readId(), tag, 0, 0);
                     break;
                 case TAG_GC_ROOT_JNI_GLOBAL:
-                    skipFully(2L * idSize);
+                    recordRoot(readId(), tag, 0, readId());
                     break;
                 case TAG_GC_ROOT_JNI_LOCAL:
                 case TAG_GC_ROOT_JAVA_FRAME:
-                case TAG_GC_ROOT_THREAD_OBJ:
-                    skipFully(idSize + 8L);
+                case TAG_GC_ROOT_THREAD_OBJ: {
+                    long objId = readId();
+                    long a = in.readInt() & 0xFFFFFFFFL;
+                    long b = in.readInt() & 0xFFFFFFFFL;
+                    recordRoot(objId, tag, a, b);
+                    if (tag == TAG_GC_ROOT_THREAD_OBJ) {
+                        threadObjIds.add(objId);
+                        if (threadSeqToObj.size() < MAX_ROOTS) {
+                            threadSeqToObj.put(a, objId);
+                        }
+                    }
                     break;
+                }
                 case TAG_GC_ROOT_NATIVE_STACK:
                 case TAG_GC_ROOT_THREAD_BLOCK:
-                    skipFully(idSize + 4L);
+                    recordRoot(readId(), tag, in.readInt() & 0xFFFFFFFFL, 0);
                     break;
                 case TAG_CLASS_DUMP:
                     parseClassDump();
@@ -433,17 +517,29 @@ public class HeapQuickScan {
         // Instance fields: u2 count, then per entry: id name, u1 type.
         // (Values live in each INSTANCE_DUMP record.)
         int fieldCount = in.readUnsignedShort();
+        long[] fieldNames = new long[fieldCount];
+        byte[] fieldTypes = new byte[fieldCount];
         int ownRefs = 0;
         for (int i = 0; i < fieldCount; i++) {
-            readId();               // field name string ID
-            if (in.readUnsignedByte() == 2) ownRefs++;
+            fieldNames[i] = readId();
+            byte t = in.readByte();
+            fieldTypes[i] = t;
+            if (t == 2) ownRefs++;
         }
 
         ClassInfo info = new ClassInfo();
         info.superId = superId;
         info.instanceSize = instanceSize;
         info.ownRefFields = ownRefs;
+        info.fieldNames = fieldNames;
+        info.fieldTypes = fieldTypes;
         classInfos.put(classId, info);
+    }
+
+    void recordRoot(long objId, int tag, long a, long b) {
+        if (roots.size() < MAX_ROOTS) {
+            roots.put(objId, new Root(tag, a, b));
+        }
     }
 
     void parseInstanceDump() throws IOException {
@@ -490,8 +586,7 @@ public class HeapQuickScan {
         recordArray(PRIM_NAME[elemType] + "[]", n, shallowArraySize(n, elemSize), arrayId);
     }
 
-    void recordArray(String typeName, long length, long size, long arrayId) {
-        long[] stats = arrayStats.get(typeName);
+    void recordArray(String typeName, long length, long size, long arrayId) {        long[] stats = arrayStats.get(typeName);
         if (stats == null) {
             stats = new long[2];
             arrayStats.put(typeName, stats);
@@ -556,6 +651,621 @@ public class HeapQuickScan {
                 throw new EOFException("Unexpected EOF at offset " + pos());
             }
         }
+    }
+
+    // ======================================================================
+    // Thread / stack / reference-path attribution
+    // ======================================================================
+
+    /** HPROF_FRAME: id frameId, id methodName, id methodSig, id srcFile, u4 classSerial, u4 lineNo. */
+    void readFrameRecord() throws IOException {
+        long frameId = readId();
+        long nameId = readId();
+        long sigId = readId();
+        long fileId = readId();
+        long classSerial = in.readInt() & 0xFFFFFFFFL;
+        long lineNo = in.readInt() & 0xFFFFFFFFL;
+        if (frames.size() < MAX_FRAMES) {
+            frames.put(frameId, new long[]{nameId, sigId, fileId, classSerial, lineNo});
+        }
+    }
+
+    /** HPROF_TRACE: u4 serial, u4 threadSerial, u4 frameCount, id frameId * frameCount. */
+    void readTraceRecord() throws IOException {
+        int serial = in.readInt();
+        int threadSerial = in.readInt();
+        int n = in.readInt();
+        if (n < 0 || n > 65536) {
+            skipFully(n * (long) idSize);
+            return;
+        }
+        long[] fr = new long[n];
+        for (int i = 0; i < n; i++) {
+            fr[i] = readId();
+        }
+        if (traces.size() < MAX_TRACES) {
+            traces.put(serial, fr);
+            traceToThreadSerial.put(serial, threadSerial);
+            if (threadSerialToTrace.size() < MAX_TRACES) {
+                threadSerialToTrace.put(threadSerial, serial);
+            }
+        }
+    }
+
+    /** Renders a stack trace serial to lines (class.method(file:line)). */
+    List<String> renderStack(int traceSerial, int maxFrames) {
+        List<String> out = new ArrayList<String>();
+        long[] fr = traces.get(traceSerial);
+        if (fr == null) return out;
+        for (int i = 0; i < fr.length && out.size() < maxFrames; i++) {
+            long[] f = frames.get(fr[i]);
+            if (f == null) continue;
+            String cls = signatureToDisplayName(className(
+                    serialToClass.get((int) f[3]) == null ? -1 : serialToClass.get((int) f[3]),
+                    "?"));
+            String method = stringTable.get(f[0]);
+            String file = stringTable.get(f[2]);
+            long line = f[4];
+            String lineStr = line == 0 ? "" : (line > 0x80000000L ? " (native)" : " ("
+                    + (file == null ? "?" : file) + ":" + (line & 0x7FFFFFFFL) + ")");
+            out.add("at " + cls + "." + method + lineStr);
+        }
+        return out;
+    }
+
+    /** Locates the string id for a literal name by scanning the string table once. */
+    Long nameStringId(String literal) {
+        for (Map.Entry<Long, String> e : stringTable.entrySet()) {
+            if (literal.equals(e.getValue())) return e.getKey();
+        }
+        return null;
+    }
+
+    /** Offset of a named own instance field within instance value bytes (Thread/Object have no superclass fields). */
+    int ownFieldOffset(long classId, long fieldNameId) {
+        ClassInfo ci = classInfos.get(classId);
+        if (ci == null) return -1;
+        int off = 0;
+        for (int i = 0; i < ci.fieldTypes.length; i++) {
+            if (ci.fieldNames[i] == fieldNameId) return off;
+            off += ci.fieldTypes[i] == 2 ? idSize : PRIM_SIZE[ci.fieldTypes[i]];
+        }
+        return -1;
+    }
+
+    /** One targeted pass: capture raw instance value bytes for the wanted object ids. */
+    void captureInstances(File file, Set<Long> wanted, Map<Long, byte[]> out) throws IOException {
+        if (wanted.isEmpty()) return;
+        long remaining = wanted.size();
+        CountingInputStream counting = new CountingInputStream(
+                new BufferedInputStream(new FileInputStream(file), 8 * 1024 * 1024));
+        DataInputStream in2 = new DataInputStream(counting);
+        try {
+            readHeaderOn(in2);
+            while (counting.count < fileSize && remaining > 0) {
+                int tag = in2.readUnsignedByte();
+                in2.readInt();
+                long length = in2.readInt() & 0xFFFFFFFFL;
+                if (tag == TAG_HEAP_DUMP || tag == TAG_HEAP_DUMP_SEGMENT) {
+                    long segEnd = counting.count + length;
+                    while (counting.count < segEnd && remaining > 0) {
+                        int st = in2.readUnsignedByte();
+                        if (st == TAG_INSTANCE_DUMP) {
+                            long objId = readIdOn(in2);
+                            in2.readInt();
+                            long classId = readIdOn(in2);
+                            int n = in2.readInt();
+                            if (wanted.contains(objId) && !out.containsKey(objId)) {
+                                byte[] buf = new byte[n];
+                                in2.readFully(buf);
+                                out.put(objId, buf);
+                                remaining--;
+                            } else {
+                                skipFullyOn(in2, n);
+                            }
+                        } else {
+                            skipSubRecordOn(in2, counting, st);
+                        }
+                    }
+                } else {
+                    skipFullyOn(in2, length);
+                }
+            }
+        } finally {
+            in2.close();
+        }
+    }
+
+    /** One targeted pass: capture the first elements of wanted primitive arrays as strings. */
+    void capturePrimArrays(File file, Set<Long> wanted, Map<Long, String> out, int maxElems) throws IOException {
+        if (wanted.isEmpty()) return;
+        long remaining = wanted.size();
+        CountingInputStream counting = new CountingInputStream(
+                new BufferedInputStream(new FileInputStream(file), 8 * 1024 * 1024));
+        DataInputStream in2 = new DataInputStream(counting);
+        try {
+            readHeaderOn(in2);
+            while (counting.count < fileSize && remaining > 0) {
+                int tag = in2.readUnsignedByte();
+                in2.readInt();
+                long length = in2.readInt() & 0xFFFFFFFFL;
+                if (tag == TAG_HEAP_DUMP || tag == TAG_HEAP_DUMP_SEGMENT) {
+                    long segEnd = counting.count + length;
+                    while (counting.count < segEnd && remaining > 0) {
+                        int st = in2.readUnsignedByte();
+                        if (st == TAG_PRIMITIVE_ARRAY_DUMP) {
+                            long objId = readIdOn(in2);
+                            in2.readInt();
+                            long n = in2.readInt() & 0xFFFFFFFFL;
+                            int etype = in2.readUnsignedByte();
+                            int es = PRIM_SIZE[etype];
+                            if (wanted.contains(objId) && !out.containsKey(objId)) {
+                                int take = (int) Math.min(n, maxElems);
+                                byte[] buf = new byte[take * es];
+                                in2.readFully(buf);
+                                out.put(objId, (etype == 5 ? "C:" : "B:") + new String(buf,
+                                        etype == 5 ? "UTF-16BE" : "UTF-8"));
+                                remaining--;
+                            } else {
+                                skipFullyOn(in2, n * es);
+                            }
+                        } else {
+                            skipSubRecordOn(in2, counting, st);
+                        }
+                    }
+                } else {
+                    skipFullyOn(in2, length);
+                }
+            }
+        } finally {
+            in2.close();
+        }
+    }
+
+    /** Resolves thread object ids to display names via Thread.name -> String -> backing array. */
+    void resolveThreadNames(File file, Map<Long, String> outNames) throws IOException {
+        Long nameId = nameStringId("name");
+        Long valueId = nameStringId("value");
+        if (nameId == null || valueId == null || threadClassId == -1) return;
+
+        Set<Long> threadIds = new HashSet<Long>(threadObjIds);
+        Map<Long, byte[]> rawThreads = new HashMap<Long, byte[]>();
+        captureInstances(file, threadIds, rawThreads);
+
+        // Thread.name is an own field of java.lang.Thread (Object adds no fields).
+        int nameOff = ownFieldOffset(threadClassId, nameId);
+        if (nameOff < 0) return;
+        Set<Long> nameStringIds = new HashSet<Long>();
+        Map<Long, Long> threadToStr = new HashMap<Long, Long>();
+        for (Map.Entry<Long, byte[]> e : rawThreads.entrySet()) {
+            if (e.getValue().length >= nameOff + idSize) {
+                long strId = idFromBytes(e.getValue(), nameOff);
+                nameStringIds.add(strId);
+                threadToStr.put(e.getKey(), strId);
+            }
+        }
+        Map<Long, byte[]> rawStrings = new HashMap<Long, byte[]>();
+        captureInstances(file, nameStringIds, rawStrings);
+
+        ClassInfo strInfo = classInfos.get(stringClassId);
+        int valueOff = strInfo == null ? 0 : ownFieldOffset(stringClassId, valueId);
+        Set<Long> arrayIds = new HashSet<Long>();
+        Map<Long, Long> strToArray = new HashMap<Long, Long>();
+        for (Map.Entry<Long, byte[]> e : rawStrings.entrySet()) {
+            if (valueOff >= 0 && e.getValue().length >= valueOff + idSize) {
+                long arrId = idFromBytes(e.getValue(), valueOff);
+                arrayIds.add(arrId);
+                strToArray.put(e.getKey(), arrId);
+            }
+        }
+        Map<Long, String> arrayVals = new HashMap<Long, String>();
+        capturePrimArrays(file, arrayIds, arrayVals, 256);
+
+        for (Long threadId : threadObjIds) {
+            Long strId = threadToStr.get(threadId);
+            Long arrId = strId == null ? null : strToArray.get(strId);
+            String name = arrId == null ? null : arrayVals.get(arrId);
+            if (name != null) {
+                int c = name.indexOf("B:");
+                outNames.put(threadId, c == 0 ? name.substring(2) : name);
+            }
+        }
+    }
+
+    long idFromBytes(byte[] b, int off) {
+        if (idSize == 8) {
+            long v = 0;
+            for (int i = 0; i < 8; i++) v = (v << 8) | (b[off + i] & 0xFFL);
+            return v;
+        }
+        long v = 0;
+        for (int i = 0; i < 4; i++) v = (v << 8) | (b[off + i] & 0xFFL);
+        return v;
+    }
+
+    // ---- stream helpers for targeted passes (operate on a secondary stream) ----
+
+    void readHeaderOn(DataInputStream in2) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream(24);
+        int b;
+        while ((b = in2.read()) != 0) {
+            if (b < 0) throw new IOException("Unexpected EOF in header");
+            buf.write(b);
+        }
+        int ids = in2.readInt();
+        in2.readLong();
+        if (ids != idSize) throw new IOException("Identifier size changed between passes?");
+    }
+
+    long readIdOn(DataInputStream in2) throws IOException {
+        if (idSize == 8) return in2.readLong();
+        return in2.readInt() & 0xFFFFFFFFL;
+    }
+
+    void skipFullyOn(DataInputStream in2, long bytes) throws IOException {
+        if (bytes <= 0) return;
+        while (bytes > 0) {
+            long skipped = in2.skip(bytes);
+            if (skipped > 0) bytes -= skipped;
+            else if (in2.read() != -1) bytes--;
+            else throw new EOFException();
+        }
+    }
+
+    /** Skips one heap sub-record on a secondary stream (roots by size, payloads by length). */
+    void skipSubRecordOn(DataInputStream in2, CountingInputStream counting, int st) throws IOException {
+        switch (st) {
+            case TAG_GC_ROOT_UNKNOWN:
+            case TAG_GC_ROOT_STICKY_CLASS:
+            case TAG_GC_ROOT_MONITOR_USED:
+                skipFullyOn(in2, idSize);
+                break;
+            case TAG_GC_ROOT_JNI_GLOBAL:
+                skipFullyOn(in2, 2L * idSize);
+                break;
+            case TAG_GC_ROOT_JNI_LOCAL:
+            case TAG_GC_ROOT_JAVA_FRAME:
+            case TAG_GC_ROOT_THREAD_OBJ:
+                skipFullyOn(in2, idSize + 8L);
+                break;
+            case TAG_GC_ROOT_NATIVE_STACK:
+            case TAG_GC_ROOT_THREAD_BLOCK:
+                skipFullyOn(in2, idSize + 4L);
+                break;
+            case TAG_CLASS_DUMP:
+                skipClassDumpOn(in2);
+                break;
+            case TAG_INSTANCE_DUMP:
+                readIdOn(in2);          // objId
+                in2.readInt();          // stack trace serial
+                readIdOn(in2);          // class id
+                skipFullyOn(in2, in2.readInt()); // n value bytes
+                break;
+            case TAG_OBJECT_ARRAY_DUMP: {
+                readIdOn(in2);
+                in2.readInt();
+                long n = in2.readInt() & 0xFFFFFFFFL;
+                readIdOn(in2);
+                skipFullyOn(in2, n * idSize);
+                break;
+            }
+            case TAG_PRIMITIVE_ARRAY_DUMP: {
+                readIdOn(in2);
+                in2.readInt();
+                long n = in2.readInt() & 0xFFFFFFFFL;
+                int es = PRIM_SIZE[in2.readUnsignedByte()];
+                skipFullyOn(in2, n * es);
+                break;
+            }
+            default:
+                long pp = -1;
+                pp = counting == null ? -1 : counting.count;
+                throw new IOException("Unknown sub-record 0x" + Integer.toHexString(st) + " at offset " + pp);
+        }
+    }
+
+    void skipClassDumpOn(DataInputStream in2) throws IOException {
+        readIdOn(in2);
+        in2.readInt();
+        for (int i = 0; i < 6; i++) readIdOn(in2);
+        in2.readInt();
+        int cp = in2.readUnsignedShort();
+        for (int i = 0; i < cp; i++) {
+            in2.readUnsignedShort();
+            skipValueOn(in2, in2.readUnsignedByte());
+        }
+        int sf = in2.readUnsignedShort();
+        for (int i = 0; i < sf; i++) {
+            readIdOn(in2);
+            skipValueOn(in2, in2.readUnsignedByte());
+        }
+        int inf = in2.readUnsignedShort();
+        for (int i = 0; i < inf; i++) {
+            readIdOn(in2);
+            in2.readUnsignedByte();
+        }
+    }
+
+    /** Skips a field value of the given hprof type code on a secondary stream. */
+    void skipValueOn(DataInputStream in2, int type) throws IOException {
+        switch (type) {
+            case 2:  skipFullyOn(in2, idSize); break;
+            case 4: case 8:  skipFullyOn(in2, 1); break;
+            case 5: case 9:  skipFullyOn(in2, 2); break;
+            case 6: case 10: skipFullyOn(in2, 4); break;
+            case 7: case 11: skipFullyOn(in2, 8); break;
+            default: throw new IOException("Unknown field type code: " + type);
+        }
+    }
+
+    // ---- reference walking + inbound BFS ----
+
+    /** Reference with a human label for path rendering. */
+    static class Ref {
+        final long src;
+        final String label;
+        Ref(long src, String label) { this.src = src; this.label = label; }
+    }
+
+    /** Memoized per-class list of (offset, label) for every reference-typed field. */
+    private final Map<Long, List<long[]>> refOffsetCache = new HashMap<Long, List<long[]>>();
+    private final Map<Long, List<String>> refLabelCache = new HashMap<Long, List<String>>();
+
+    void refOffsets(long classId, int base, List<long[]> offs, List<String> labels) {
+        if (classId == 0 || base > 4096) return;
+        ClassInfo ci = classInfos.get(classId);
+        if (ci == null) return;
+        int off = base;
+        for (int i = 0; i < ci.fieldTypes.length; i++) {
+            if (ci.fieldTypes[i] == 2) {
+                offs.add(new long[]{off});
+                String n = stringTable.get(ci.fieldNames[i]);
+                labels.add(n == null ? "?" : n);
+            }
+            off += ci.fieldTypes[i] == 2 ? idSize : PRIM_SIZE[ci.fieldTypes[i]];
+        }
+        refOffsets(ci.superId, off, offs, labels);
+    }
+
+    /**
+     * One reference-yielding pass over the heap. Calls back for every
+     * instance field ref, object-array element and class static ref.
+     * Returns early when the visitor returns true.
+     */
+    interface RefVisitor { boolean seeRef(long srcId, long dstId, String label) throws IOException; }
+
+    boolean walkRefs(File file, RefVisitor visitor) throws IOException {
+        CountingInputStream counting = new CountingInputStream(
+                new BufferedInputStream(new FileInputStream(file), 8 * 1024 * 1024));
+        DataInputStream in2 = new DataInputStream(counting);
+        boolean stop = false;
+        try {
+            readHeaderOn(in2);
+            refOffsetCache.clear();
+            refLabelCache.clear();
+            while (counting.count < fileSize && !stop) {
+                int tag = in2.readUnsignedByte();
+                in2.readInt();
+                long length = in2.readInt() & 0xFFFFFFFFL;
+                if (tag == TAG_HEAP_DUMP || tag == TAG_HEAP_DUMP_SEGMENT) {
+                    long segEnd = counting.count + length;
+                    while (counting.count < segEnd && !stop) {
+                        int st = in2.readUnsignedByte();
+                        if (st == TAG_INSTANCE_DUMP) {
+                            long srcId = readIdOn(in2);
+                            in2.readInt();
+                            long classId = readIdOn(in2);
+                            int n = in2.readInt();
+                            List<long[]> offs = refOffsetCache.get(classId);
+                            if (offs == null) {
+                                offs = new ArrayList<long[]>();
+                                List<String> labels = new ArrayList<String>();
+                                refOffsets(classId, 0, offs, labels);
+                                refOffsetCache.put(classId, offs);
+                                refLabelCache.put(classId, labels);
+                            }
+                            byte[] buf = new byte[n];
+                            in2.readFully(buf);
+                            List<String> labels = refLabelCache.get(classId);
+                            for (int i = 0; i < offs.size(); i++) {
+                                long dst = idFromBytes(buf, (int) offs.get(i)[0]);
+                                if (dst != 0) {
+                                    stop = visitor.seeRef(srcId, dst, labels.get(i));
+                                    if (stop) break;
+                                }
+                            }
+                        } else if (st == TAG_OBJECT_ARRAY_DUMP) {
+                            long srcId = readIdOn(in2);
+                            in2.readInt();
+                            long n = in2.readInt() & 0xFFFFFFFFL;
+                            readIdOn(in2);
+                            for (long i = 0; i < n && !stop; i++) {
+                                long dst = readIdOn(in2);
+                                if (dst != 0) {
+                                    stop = visitor.seeRef(srcId, dst, "[" + i + "]");
+                                }
+                            }
+                        } else if (st == TAG_CLASS_DUMP) {
+                            long srcId = readIdOn(in2);
+                            in2.readInt();
+                            for (int i = 0; i < 6; i++) readIdOn(in2);
+                            in2.readInt();
+                            int cp = in2.readUnsignedShort();
+                            for (int i = 0; i < cp; i++) {
+                                in2.readUnsignedShort();
+                                skipValueOn(in2, in2.readUnsignedByte());
+                            }
+                            int sf = in2.readUnsignedShort();
+                            for (int i = 0; i < sf && !stop; i++) {
+                                long nameId = readIdOn(in2);
+                                int t = in2.readUnsignedByte();
+                                if (t == 2) {
+                                    long dst = readIdOn(in2);
+                                    String nm = stringTable.get(nameId);
+                                    stop = visitor.seeRef(srcId, dst, "static " + (nm == null ? "?" : nm));
+                                } else {
+                                    skipValueOn(in2, t);
+                                }
+                            }
+                            int inf = in2.readUnsignedShort();
+                            skipFullyOn(in2, inf * (idSize + 1L));
+                        } else {
+                            skipSubRecordOn(in2, counting, st);
+                        }
+                    }
+                } else {
+                    skipFullyOn(in2, length);
+                }
+            }
+        } finally {
+            in2.close();
+        }
+        return stop;
+    }
+
+    /** paths command: inbound BFS from an object id to the nearest GC root. */
+    void reportPaths(File file, long targetId, int maxDepth) throws IOException {
+        String targetName = prettyClassName(className(targetId, "object @" + Long.toHexString(targetId)));
+        Root targetRoot = roots.get(targetId);
+        if (targetRoot != null) {
+            System.out.println("Object " + targetName + " @0x" + Long.toHexString(targetId)
+                    + " is itself a GC root (" + rootType(targetRoot) + describeThreadRoot(targetRoot) + ").");
+            printRootStack(targetRoot);
+            return;
+        }
+
+        Set<Long> frontier = new HashSet<Long>();
+        frontier.add(targetId);
+        Set<Long> visited = new HashSet<Long>();
+        visited.add(targetId);
+        Map<Long, Object[]> parent = new HashMap<Long, Object[]>(); // srcId -> {viaId, label}
+        long foundRoot = -1;
+        int depth = 0;
+
+        while (!frontier.isEmpty() && depth < maxDepth && foundRoot == -1) {
+            depth++;
+            final Set<Long> frontierF = frontier;
+            Set<Long> next = new HashSet<Long>();
+            final Set<Long> nextF = next;
+            boolean hit = walkRefs(file, new RefVisitor() {
+                private int added;
+                public boolean seeRef(long src, long dst, String label) {
+                    if (!frontierF.contains(dst)) return false;
+                    if (parent.containsKey(src) || visited.contains(src)) return false;
+                    parent.put(src, new Object[]{dst, label});
+                    visited.add(src);
+                    if (roots.containsKey(src)) return true;
+                    if (nextF.size() < 20000) nextF.add(src);
+                    return false;
+                }
+            });
+            if (hit) {
+                for (Long src : parent.keySet()) {
+                    if (roots.containsKey(src)) { foundRoot = src; break; }
+                }
+            }
+            frontier = next;
+            System.err.printf("  depth %d: frontier %d, visited %d%s%n",
+                    depth, frontier.size(), visited.size(), hit ? ", root reached" : "");
+        }
+
+        if (foundRoot == -1) {
+            System.out.println("No GC root reachable within " + maxDepth
+                    + " reference hops from " + targetName + " @0x" + Long.toHexString(targetId)
+                    + " (visited " + visited.size() + " referrers).");
+            return;
+        }
+
+        // Reconstruct root -> ... -> target (parent[src] = {viaId, label-of-edge-src->via})
+        List<Object[]> chain = new ArrayList<Object[]>();
+        long cur = foundRoot;
+        while (cur != targetId) {
+            Object[] p = parent.get(cur);
+            if (p == null) break;
+            chain.add(new Object[]{cur, p[1]});
+            cur = (Long) p[0];
+        }
+        chain.add(new Object[]{targetId, "TARGET"});
+
+        System.out.println("=== Shortest path to GC root (" + depth + " hops) ===");
+        System.out.println();
+        for (int i = 0; i < chain.size(); i++) {
+            long id = (Long) chain.get(i)[0];
+            String label = (String) chain.get(i)[1];
+            String name = prettyClassName(className(id, "object @" + Long.toHexString(id)));
+            String indent = i == 0 ? "" : "  ";
+            for (int s = 1; s < i; s++) indent += "  ";
+            if (i == 0) {
+                Root r = roots.get(id);
+                System.out.println(indent + "ROOT: " + name + " @0x" + Long.toHexString(id)
+                        + (r != null ? "  [GC root: " + rootType(r) + describeThreadRoot(r) + "]" : ""));
+            } else if (label.equals("TARGET")) {
+                System.out.println(indent + "\u2514\u2500 TARGET: " + name + " @0x"
+                        + Long.toHexString(id));
+            } else {
+                System.out.println(indent + "\u2514\u2500 \"" + label + "\" \u2192 " + name
+                        + " @0x" + Long.toHexString(id));
+            }
+        }
+        Root r = roots.get(foundRoot);
+        if (r != null) {
+            System.out.println();
+            printRootStack(r);
+        }
+    }
+
+    private final Map<Long, String> threadNames = new HashMap<Long, String>();
+    private final Map<Long, Long> threadSeqToObj = new HashMap<Long, Long>();
+
+    Long threadSeqToObj(long seq) {
+        return threadSeqToObj.get(seq);
+    }
+
+    /** Prints the Java stack of a thread-attributed root, when resolvable. */
+    void printRootStack(Root r) {
+        Integer stackSeq = null;
+        if (r.tag == TAG_GC_ROOT_THREAD_OBJ) stackSeq = (int) r.b;
+        else if (r.tag == TAG_GC_ROOT_JNI_LOCAL || r.tag == TAG_GC_ROOT_JAVA_FRAME) {
+            Integer ts = threadSerialToTrace.get((int) r.a);
+            stackSeq = ts;
+        }
+        if (stackSeq == null) return;
+        List<String> stack = renderStack(stackSeq, 15);
+        if (stack.isEmpty()) return;
+        Long threadObj = threadSeqToObj.get(r.a);
+        String name = threadObj == null ? null : threadNames.get(threadObj);
+        System.out.println("Owning thread: " + (name != null ? "\"" + name + "\"" : "seq " + r.a)
+                + (r.tag == TAG_GC_ROOT_JAVA_FRAME || r.tag == TAG_GC_ROOT_JNI_LOCAL
+                    ? "  (frame " + r.b + ")" : ""));
+        for (String line : stack) System.out.println("  " + line);
+    }
+
+    String rootType(Root r) {
+        switch (r.tag) {
+            case TAG_GC_ROOT_THREAD_OBJ: return "thread object";
+            case TAG_GC_ROOT_JNI_LOCAL: return "JNI local";
+            case TAG_GC_ROOT_JAVA_FRAME: return "Java stack frame";
+            case TAG_GC_ROOT_JNI_GLOBAL: return "JNI global";
+            case TAG_GC_ROOT_STICKY_CLASS: return "sticky class";
+            case TAG_GC_ROOT_THREAD_BLOCK: return "thread block";
+            case TAG_GC_ROOT_NATIVE_STACK: return "native stack";
+            case TAG_GC_ROOT_MONITOR_USED: return "monitor";
+            default: return "unknown";
+        }
+    }
+
+    String describeThreadRoot(Root r) {
+        if (r.tag == TAG_GC_ROOT_THREAD_OBJ) {
+            Long objId = threadSeqToObj.get(r.a);
+            String n = objId == null ? null : threadNames.get(objId);
+            return n != null ? ", thread \"" + n + "\"" : "";
+        }
+        if (r.tag == TAG_GC_ROOT_JNI_LOCAL || r.tag == TAG_GC_ROOT_JAVA_FRAME) {
+            Long objId = threadSeqToObj.get(r.a);
+            String n = objId == null ? null : threadNames.get(objId);
+            return (n != null ? ", thread \"" + n + "\"" : "") + ", frame " + r.b;
+        }
+        return "";
     }
 
     // ======================================================================
@@ -708,8 +1418,44 @@ public class HeapQuickScan {
                 uncompressedOops ? compressedVotes : uncompressedVotes);
     }
 
-    void report(String command, int topN, String sort) {
-        if (command.equals("top-arrays")) {
+    /** threads command: per-thread name, directly rooted locals, and Java stack. */
+    void reportThreads(int topN) {
+        final Map<Long, Integer> localsBySeq = new HashMap<Long, Integer>();
+        for (Root x : roots.values()) {
+            if (x.tag == TAG_GC_ROOT_JNI_LOCAL || x.tag == TAG_GC_ROOT_JAVA_FRAME) {
+                Integer c = localsBySeq.get(x.a);
+                localsBySeq.put(x.a, c == null ? 1 : c + 1);
+            }
+        }
+        System.out.println("=== Threads (" + threadObjIds.size() + " thread objects) ===");
+        System.out.println();
+        int shown = 0;
+        for (long threadId : threadObjIds) {
+            if (shown >= topN) break;
+            Root r = roots.get(threadId);
+            String name = threadNames.get(threadId);
+            long seq = r == null ? -1 : r.a;
+            long stackSeq = r == null ? -1 : r.b;
+            Integer locals = localsBySeq.get(seq);
+
+            System.out.println("Thread \"" + (name != null ? name : ("seq " + seq)) + "\" @0x"
+                    + Long.toHexString(threadId) + "  (locals rooted: "
+                    + (locals == null ? 0 : locals.intValue()) + ")");
+            List<String> stack = renderStack((int) stackSeq, 10);
+            if (stack.isEmpty()) {
+                System.out.println("  (no stack frames in dump)");
+            } else {
+                for (String line : stack) System.out.println("  " + line);
+            }
+            System.out.println();
+            shown++;
+        }
+        if (threadObjIds.size() > shown) {
+            System.out.println("(" + (threadObjIds.size() - shown) + " more threads, use -n)");
+        }
+    }
+
+    void report(String command, int topN, String sort) {        if (command.equals("top-arrays")) {
             reportTopArrays(topN);
             return;
         }

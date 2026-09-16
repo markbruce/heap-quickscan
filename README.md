@@ -18,7 +18,9 @@ Fast JVM heap dump (.hprof) triage CLI — class histograms and the identity of 
 |---------|--------|
 | `top-classes` | Classes (incl. array types) ranked by shallow size or instance count |
 | `top-arrays` | The largest individual arrays: size, length, type, **object ID** |
-| `summary` | Heap totals + both of the above |
+| `threads` | Every thread with its name and Java stack, from the dump itself |
+| `paths <objectId>` | Shortest reference path from an object to its GC root, with owning thread + stack |
+| `summary` | Heap totals + top classes + top arrays |
 
 ### Feature comparison with MAT
 
@@ -75,6 +77,25 @@ java -cp target HeapQuickScan top-classes /path/to/dump.hprof -n 50 --sort count
 java -cp target HeapQuickScan top-arrays  /path/to/dump.hprof -n 30    # biggest arrays + object IDs
 java -cp target HeapQuickScan summary    /path/to/dump.hprof
 java -cp target HeapQuickScan --uncompressed-oops summary /path/to/dump.hprof  # override oops detection
+
+# Thread attribution (Java tool only)
+java -cp target HeapQuickScan threads /path/to/dump.hprof
+java -cp target HeapQuickScan paths /path/to/dump.hprof 0x7d1800000
+```
+
+`paths` walks inbound references level by level (one file pass per level, whole
+query typically 1-6 min on a 15 GB dump under `-Xmx1g`) and reproduces MAT's
+"path to GC roots + owning thread + stack" for a specific object without any
+index. Example from a 15.5 GB production dump (leaked xlsx export):
+
+```
+ROOT: object @631719d20  [GC root: Java stack frame, thread "Jetty-Worker-69", frame 11]
+  └─ "table" → object @63171c350
+    └─ TARGET: object @7d1800000
+Owning thread: "Jetty-Worker-9170-Thread-69" (frame 11)
+  at org.apache.poi.xssf.model.SharedStringsTable.addEntry (SharedStringsTable.java:202)
+  at org.apache.poi.xssf.usermodel.XSSFCell.setCellValueImpl (XSSFCell.java:427)
+  at com.example.utils.ExportExcelWrapper.exportExcel2007 (ExportExcelWrapper.java:160)
 ```
 
 ### Verified accuracy

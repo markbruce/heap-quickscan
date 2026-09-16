@@ -81,6 +81,12 @@ java -cp target HeapQuickScan --uncompressed-oops summary /path/to/dump.hprof  #
 # Thread attribution (Java tool only)
 java -cp target HeapQuickScan threads /path/to/dump.hprof
 java -cp target HeapQuickScan paths /path/to/dump.hprof 0x7d1800000
+
+# Fastest: build the first-referrer index during one pass (--parents), then
+# attribute ANY number of objects instantly. Needs heap ~ 40 bytes per heap
+# object (e.g. -Xmx20g for a 229M-object dump); on smaller heaps drop the flag
+# and paths falls back to per-object BFS (no extra memory, 1-6 min each).
+java -Xmx20g -cp target HeapQuickScan paths --parents /path/to/dump.hprof 0x631719d20 0x7d1800000
 ```
 
 `paths` walks inbound references level by level (one file pass per level, whole

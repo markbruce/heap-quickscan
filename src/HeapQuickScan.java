@@ -152,9 +152,105 @@ public class HeapQuickScan {
     final Map<Integer, Integer> threadSerialToTrace = new HashMap<Integer, Integer>();
     final List<Long> threadObjIds = new ArrayList<Long>();         // THREAD_OBJ-rooted object ids
     long threadClassId = -1;
-    static int HQS_DBG;
-    final List<long[]> _dbg = new ArrayList<long[]>();
     int oopsStringVotesCompressed, oopsStringVotesUncompressed;
+
+    // ---- first-referrer index ("who points at me"), optional ----
+    // Open-addressing long->long map: object id -> first referrer seen in file
+    // order. Thread-sourced edges take priority so paths lead to threads.
+    // Enabled with --parents; needs heap ~= 22 bytes per heap object.
+    ParentIndex parents;
+    boolean parentsDegraded;
+
+    // ---- reference extraction during the main scan (parent capture) ----
+    private final Map<Long, List<long[]>> mainRefOffsetCache = new HashMap<Long, List<long[]>>();
+    private byte[] payloadBuf = new byte[65536];
+
+    static class ParentIndex {
+        long[] keys;               // 0 = empty slot (null refs never stored)
+        long[] vals;
+        byte[] threadSrc;          // 1 if edge came from a thread-side source
+        int mask;
+        int shift;                 // 64 - log2(capacity): index uses the HIGH bits
+        long size;
+        long maxSlots;
+        boolean degraded;
+
+        ParentIndex(long maxSlots) {
+            this.maxSlots = maxSlots;
+            int cap = 1 << 16;
+            keys = new long[cap];
+            vals = new long[cap];
+            threadSrc = new byte[cap];
+            mask = cap - 1;
+            shift = 64 - 16;
+        }
+
+        /** First referrer wins; a thread-side referrer replaces a plain one. */
+        void put(long k, long v, boolean threadSrcEdge) {
+            if (k == 0) return;
+            if (size >= (mask + 1L) * 6L / 10L) {
+                if (!grow()) { degraded = true; return; }
+            }
+            int i = index(k);
+            while (keys[i] != 0) {
+                if (keys[i] == k) {
+                    if (threadSrcEdge && threadSrc[i] == 0) threadSrc[i] = 1;
+                    return;                        // keep first referrer
+                }
+                i = (i + 1) & mask;
+            }
+            if (degraded) return;                  // table full: stop inserting
+            keys[i] = k;
+            vals[i] = v;
+            threadSrc[i] = (byte) (threadSrcEdge ? 1 : 0);
+            size++;
+        }
+
+        long get(long k) {
+            int i = index(k);
+            while (keys[i] != 0) {
+                if (keys[i] == k) return vals[i];
+                i = (i + 1) & mask;
+            }
+            return -1;
+        }
+
+        boolean isThreadEdge(long k) {
+            int i = index(k);
+            while (keys[i] != 0) {
+                if (keys[i] == k) return threadSrc[i] == 1;
+                i = (i + 1) & mask;
+            }
+            return false;
+        }
+
+        private int index(long k) {
+            long h = k * 0x9E3779B97F4A7C15L;
+            return (int) (h >>> shift) & mask;
+        }
+
+        private boolean grow() {
+            if ((mask + 1L) >= maxSlots) return false;
+            long[] ok = keys;
+            long[] ov = vals;
+            byte[] ot = threadSrc;
+            int cap = (mask + 1) * 2;
+            keys = new long[cap];
+            vals = new long[cap];
+            threadSrc = new byte[cap];
+            mask = cap - 1;
+            shift = 64 - (32 - Integer.numberOfLeadingZeros(mask));
+            for (int i = 0; i < ok.length; i++) {
+                if (ok[i] == 0) continue;
+                int j = index(ok[i]);
+                while (keys[j] != 0) j = (j + 1) & mask;
+                keys[j] = ok[i];
+                vals[j] = ov[i];
+                threadSrc[j] = ot[i];
+            }
+            return true;
+        }
+    }
     // array type display name -> {count, totalBytes}
     final Map<String, long[]> arrayStats = new HashMap<String, long[]>();
 
@@ -215,6 +311,8 @@ public class HeapQuickScan {
                 }
             } else if ("--uncompressed-oops".equals(a)) {
                 // parsed into the scanner below
+            } else if ("--parents".equals(a)) {
+                // parsed into the scanner below
             } else if (a.startsWith("-")) {
                 fail("Unknown option: " + a);
                 return;
@@ -235,6 +333,8 @@ public class HeapQuickScan {
             return;
         }
         boolean needsObject = command.equals("paths");
+        boolean wantsParents = false;
+        for (String a : args) if ("--parents".equals(a)) wantsParents = true;
         if (!command.equals("top-classes") && !command.equals("top-arrays") && !command.equals("summary")
                 && !command.equals("threads") && !needsObject) {
             fail("Unknown command: " + command);
@@ -249,6 +349,10 @@ public class HeapQuickScan {
         boolean forceUncompressedF = false;
         for (String a : args) {
             if ("--uncompressed-oops".equals(a)) { scanner.uncompressedOops = true; forceUncompressedF = true; }
+        }
+        if (wantsParents || (needsObject && Runtime.getRuntime().maxMemory() >= 3L * 1024 * 1024 * 1024)) {
+            long maxSlots = Math.min(1L << 29, Runtime.getRuntime().maxMemory() / 17L / 2);
+            scanner.parents = new ParentIndex(maxSlots);
         }
         try {
             scanner.scan(filePath);
@@ -271,11 +375,14 @@ public class HeapQuickScan {
         if (command.equals("threads")) {
             scanner.reportThreads(topN);
         } else if (needsObject) {
-            long targetId = objectIdArg.toLowerCase().startsWith("0x")
-                    ? Long.parseLong(objectIdArg.substring(2), 16)
-                    : Long.parseLong(objectIdArg);
+            List<Long> targets = new ArrayList<Long>();
+            for (String tok : objectIdArg.split("[,\\s]+")) {
+                String t = tok.toLowerCase();
+                if (t.isEmpty()) continue;
+                targets.add(t.startsWith("0x") ? Long.parseLong(t.substring(2), 16) : Long.parseLong(t));
+            }
             try {
-                scanner.reportPaths(dumpFile, targetId, 30);
+                scanner.reportPaths(dumpFile, targets, 30);
             } catch (IOException e) {
                 fail("Path search failed: " + e.getMessage());
             }
@@ -511,7 +618,13 @@ public class HeapQuickScan {
         int staticCount = in.readUnsignedShort();
         for (int i = 0; i < staticCount; i++) {
             readId();               // field name string ID
-            skipValue(in.readUnsignedByte());
+            int vt = in.readUnsignedByte();
+            if (parents != null && vt == 2) {
+                long dst = readId();
+                if (dst != 0 && dst != classId) putParent(dst, classId, 0);
+            } else {
+                skipValue(vt);
+            }
         }
 
         // Instance fields: u2 count, then per entry: id name, u1 type.
@@ -536,6 +649,57 @@ public class HeapQuickScan {
         classInfos.put(classId, info);
     }
 
+    /** Memoized ref-field byte offsets (and labels) for instances of a class. */
+    private void mainRefOffsets(long classId, int base, List<long[]> offs, List<String> labels) {
+        if (classId == 0 || offs.size() > 4096) return;
+        ClassInfo ci = classInfos.get(classId);
+        if (ci == null) return;
+        int off = 0;
+        for (int i = 0; i < ci.fieldTypes.length; i++) {
+            if (ci.fieldTypes[i] == 2) {
+                offs.add(new long[]{off});
+                String n = stringTable.get(ci.fieldNames[i]);
+                labels.add(n == null ? "?" : n);
+            }
+            off += ci.fieldTypes[i] == 2 ? idSize : PRIM_SIZE[ci.fieldTypes[i]];
+        }
+        mainRefOffsets(ci.superId, off, offs, labels);
+    }
+
+    private List<long[]> mainRefOffsets(long classId) {
+        List<long[]> offs = mainRefOffsetCache.get(classId);
+        if (offs == null) {
+            offs = new ArrayList<long[]>();
+            List<String> labels = new ArrayList<String>();
+            mainRefOffsets(classId, 0, offs, labels);
+            mainRefOffsetCache.put(classId, offs);
+        }
+        return offs;
+    }
+
+    private final Map<Long, Boolean> threadClassCache = new HashMap<Long, Boolean>();
+
+    private boolean isThreadClass(long classId) {
+        if (classId == 0 || threadClassId == -1) return false;
+        Boolean b = threadClassCache.get(classId);
+        if (b != null) return b;
+        boolean r = classId == threadClassId || isThreadClass(classInfos.get(classId) == null ? 0 : classInfos.get(classId).superId);
+        threadClassCache.put(classId, r);
+        return r;
+    }
+
+    private void in2ReadFully(int n) throws IOException {
+        in.readFully(payloadBuf, 0, n);
+    }
+
+    private void skipFullyOnMain(long bytes) throws IOException {
+        skipFully(bytes);
+    }
+
+    private void putParent(long dst, long src, long srcClassId) {
+        parents.put(dst, src, isThreadClass(srcClassId));
+    }
+
     void recordRoot(long objId, int tag, long a, long b) {
         if (roots.size() < MAX_ROOTS) {
             roots.put(objId, new Root(tag, a, b));
@@ -547,7 +711,19 @@ public class HeapQuickScan {
         in.readInt();              // stack trace serial number
         long classId = readId();
         int valueBytes = in.readInt(); // number of instance-field bytes that follow
-        skipFully(valueBytes);
+        if (parents != null) {
+            if (valueBytes > payloadBuf.length) {
+                payloadBuf = new byte[Math.max(valueBytes, payloadBuf.length * 2)];
+            }
+            in.readFully(payloadBuf, 0, valueBytes);
+            List<long[]> offs = mainRefOffsets(classId);
+            for (int i = 0; i < offs.size(); i++) {
+                long dst = idFromBytes(payloadBuf, (int) offs.get(i)[0]);
+                if (dst != 0 && dst != objId) putParent(dst, objId, classId);
+            }
+        } else {
+            skipFully(valueBytes);
+        }
 
         if (classId == stringClassId && stringSampleCount < OOPS_SAMPLE_CAP) {
             if (stringSampleCount == stringSample.length) {
@@ -565,7 +741,22 @@ public class HeapQuickScan {
         in.readInt();              // stack trace serial number
         long n = in.readInt() & 0xFFFFFFFFL; // number of elements
         long arrayClassId = readId();
-        skipFully(n * idSize);     // element IDs
+        if (parents != null && n > 0) {
+            long bytes = n * idSize;
+            if (bytes > payloadBuf.length) {
+                payloadBuf = new byte[(int) Math.min(bytes, Math.max(payloadBuf.length * 2, 1 << 26))];
+            }
+            int take = (int) Math.min(bytes, payloadBuf.length);
+            in2ReadFully(take);
+            long takeN = take / idSize;
+            for (long i = 0; i < takeN; i++) {
+                long dst = idFromBytes(payloadBuf, (int) (i * idSize));
+                if (dst != 0 && dst != arrayId) parents.put(dst, arrayId, false);
+            }
+            skipFullyOnMain(bytes - take);
+        } else {
+            skipFully(n * idSize);     // element IDs
+        }
 
         recordArray(prettyClassName(className(arrayClassId, "object[]")),
                 n, shallowArraySize(n, objectRefWidth()), arrayId);
@@ -1123,8 +1314,38 @@ public class HeapQuickScan {
         return stop;
     }
 
-    /** paths command: inbound BFS from an object id to the nearest GC root. */
-    void reportPaths(File file, long targetId, int maxDepth) throws IOException {
+    /** Renders a root->target chain. Entry label "TARGET" marks the queried object. */
+    void printChain(List<Object[]> chain) {
+        for (int i = 0; i < chain.size(); i++) {
+            long id = (Long) chain.get(i)[0];
+            String label = (String) chain.get(i)[1];
+            String name = prettyClassName(className(id, "object @" + Long.toHexString(id)));
+            String indent = i == 0 ? "" : "  ";
+            for (int s = 1; s < i; s++) indent += "  ";
+            if (i == 0) {
+                Root r = roots.get(id);
+                System.out.println(indent + "ROOT: " + name + " @0x" + Long.toHexString(id)
+                        + (r != null ? "  [GC root: " + rootType(r) + describeThreadRoot(r) + "]" : ""));
+            } else if (label.equals("TARGET")) {
+                System.out.println(indent + "\u2514\u2500 TARGET: " + name + " @0x" + Long.toHexString(id));
+            } else if (label.equals("(reference)")) {
+                System.out.println(indent + "\u2514\u2500 references \u2192 " + name + " @0x" + Long.toHexString(id));
+            } else {
+                System.out.println(indent + "\u2514\u2500 \"" + label + "\" \u2192 " + name
+                        + " @0x" + Long.toHexString(id));
+            }
+        }
+    }
+
+    /** paths command: parent-index chain first (instant), BFS fallback per target. */
+    void reportPaths(File file, List<Long> targets, int maxDepth) throws IOException {
+        for (int i = 0; i < targets.size(); i++) {
+            if (i > 0) System.out.println();
+            reportOnePath(file, targets.get(i).longValue(), maxDepth);
+        }
+    }
+
+    void reportOnePath(File file, long targetId, int maxDepth) throws IOException {
         String targetName = prettyClassName(className(targetId, "object @" + Long.toHexString(targetId)));
         Root targetRoot = roots.get(targetId);
         if (targetRoot != null) {
@@ -1132,6 +1353,38 @@ public class HeapQuickScan {
                     + " is itself a GC root (" + rootType(targetRoot) + describeThreadRoot(targetRoot) + ").");
             printRootStack(targetRoot);
             return;
+        }
+
+        // Fast path: walk the first-referrer index (built with --parents / paths).
+        if (parents != null && !parents.degraded) {
+            List<Object[]> chain = new ArrayList<Object[]>(); // root->...->target, {id, label:""}
+            Set<Long> seen = new HashSet<Long>();
+            seen.add(targetId);
+            long cur = targetId;
+            boolean rooted = roots.containsKey(cur);
+            int steps = 0;
+            while (!rooted && steps++ < 100000) {
+                long p = parents.get(cur);
+                if (p == -1 || seen.contains(p)) break;   // unknown referrer or cycle
+                chain.add(new Object[]{p, "(reference)"});
+                seen.add(p);
+                cur = p;
+                rooted = roots.containsKey(cur);
+            }
+            if (rooted) {
+                Collections.reverse(chain);
+                chain.add(new Object[]{targetId, "TARGET"});
+                System.out.println("=== Path to GC root via first-referrer index (" + (chain.size() - 1) + " hops) ===");
+                System.out.println();
+                printChain(chain);
+                Root rr = roots.get(cur);
+                if (rr != null) {
+                    System.out.println();
+                    printRootStack(rr);
+                }
+                return;
+            }
+            System.out.println("(first-referrer index has no rooted chain for this object; falling back to BFS)");
         }
 
         Set<Long> frontier = new HashSet<Long>();
@@ -1187,26 +1440,9 @@ public class HeapQuickScan {
         }
         chain.add(new Object[]{targetId, "TARGET"});
 
-        System.out.println("=== Shortest path to GC root (" + depth + " hops) ===");
+        System.out.println("=== Shortest path to GC root via inbound BFS (" + depth + " hops) ===");
         System.out.println();
-        for (int i = 0; i < chain.size(); i++) {
-            long id = (Long) chain.get(i)[0];
-            String label = (String) chain.get(i)[1];
-            String name = prettyClassName(className(id, "object @" + Long.toHexString(id)));
-            String indent = i == 0 ? "" : "  ";
-            for (int s = 1; s < i; s++) indent += "  ";
-            if (i == 0) {
-                Root r = roots.get(id);
-                System.out.println(indent + "ROOT: " + name + " @0x" + Long.toHexString(id)
-                        + (r != null ? "  [GC root: " + rootType(r) + describeThreadRoot(r) + "]" : ""));
-            } else if (label.equals("TARGET")) {
-                System.out.println(indent + "\u2514\u2500 TARGET: " + name + " @0x"
-                        + Long.toHexString(id));
-            } else {
-                System.out.println(indent + "\u2514\u2500 \"" + label + "\" \u2192 " + name
-                        + " @0x" + Long.toHexString(id));
-            }
-        }
+        printChain(chain);
         Root r = roots.get(foundRoot);
         if (r != null) {
             System.out.println();

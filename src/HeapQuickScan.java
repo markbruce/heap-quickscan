@@ -166,51 +166,48 @@ public class HeapQuickScan {
     private byte[] payloadBuf = new byte[65536];
 
     static class ParentIndex {
+        // 16 B/slot: key (8) + value (8, bit63 = thread-sourced edge flag).
+        // Object addresses use <= 47 significant bits, so bit63 is free.
+        static final long THREAD_FLAG = Long.MIN_VALUE;
         long[] keys;               // 0 = empty slot (null refs never stored)
         long[] vals;
-        byte[] threadSrc;          // 1 if edge came from a thread-side source
-        int mask;
-        int shift;                 // 64 - log2(capacity): index uses the HIGH bits
+        int cap;
         long size;
         long maxSlots;
         boolean degraded;
 
         ParentIndex(long maxSlots) {
             this.maxSlots = maxSlots;
-            int cap = 1 << 16;
+            cap = 1 << 16;
             keys = new long[cap];
             vals = new long[cap];
-            threadSrc = new byte[cap];
-            mask = cap - 1;
-            shift = 64 - 16;
         }
 
-        /** First referrer wins; a thread-side referrer replaces a plain one. */
+        /** First referrer wins; a thread-sourced referrer replaces a plain one. */
         void put(long k, long v, boolean threadSrcEdge) {
             if (k == 0) return;
-            if (size >= (mask + 1L) * 6L / 10L) {
+            if (size >= cap * 3L / 4L) {
                 if (!grow()) { degraded = true; return; }
             }
             int i = index(k);
             while (keys[i] != 0) {
                 if (keys[i] == k) {
-                    if (threadSrcEdge && threadSrc[i] == 0) threadSrc[i] = 1;
+                    if (threadSrcEdge) vals[i] |= THREAD_FLAG;
                     return;                        // keep first referrer
                 }
-                i = (i + 1) & mask;
+                i = (i + 1) % cap;
             }
             if (degraded) return;                  // table full: stop inserting
             keys[i] = k;
-            vals[i] = v;
-            threadSrc[i] = (byte) (threadSrcEdge ? 1 : 0);
+            vals[i] = threadSrcEdge ? (v | THREAD_FLAG) : v;
             size++;
         }
 
         long get(long k) {
             int i = index(k);
             while (keys[i] != 0) {
-                if (keys[i] == k) return vals[i];
-                i = (i + 1) & mask;
+                if (keys[i] == k) return vals[i] & Long.MAX_VALUE;
+                i = (i + 1) % cap;
             }
             return -1;
         }
@@ -218,39 +215,45 @@ public class HeapQuickScan {
         boolean isThreadEdge(long k) {
             int i = index(k);
             while (keys[i] != 0) {
-                if (keys[i] == k) return threadSrc[i] == 1;
-                i = (i + 1) & mask;
+                if (keys[i] == k) return (vals[i] & THREAD_FLAG) != 0;
+                i = (i + 1) % cap;
             }
             return false;
         }
 
         private int index(long k) {
             long h = k * 0x9E3779B97F4A7C15L;
-            return (int) (h >>> shift) & mask;
+            return (int) Long.remainderUnsigned(h, cap);
         }
 
+        /** x1.5 growth (non-power-of-two capacity works with modulo) halves the rehash memory peak. */
         private boolean grow() {
-            if ((mask + 1L) >= maxSlots) return false;
+            long newCap = cap + Math.max(cap / 2, 65536);
+            if (newCap > maxSlots) return false;
             long[] ok = keys;
             long[] ov = vals;
-            byte[] ot = threadSrc;
-            int cap = (mask + 1) * 2;
-            keys = new long[cap];
-            vals = new long[cap];
-            threadSrc = new byte[cap];
-            mask = cap - 1;
-            shift = 64 - (32 - Integer.numberOfLeadingZeros(mask));
-            for (int i = 0; i < ok.length; i++) {
-                if (ok[i] == 0) continue;
-                int j = index(ok[i]);
-                while (keys[j] != 0) j = (j + 1) & mask;
-                keys[j] = ok[i];
-                vals[j] = ov[i];
-                threadSrc[j] = ot[i];
+            try {
+                keys = new long[(int) newCap];
+                vals = new long[(int) newCap];
+                cap = (int) newCap;
+                for (int i = 0; i < ok.length; i++) {
+                    if (ok[i] == 0) continue;
+                    int j = index(ok[i]);
+                    while (keys[j] != 0) j = (j + 1) % cap;
+                    keys[j] = ok[i];
+                    vals[j] = ov[i];
+                }
+                return true;
+            } catch (OutOfMemoryError e) {
+                keys = ok;                 // keep serving existing entries;
+                vals = ov;                 // paths falls back to BFS for misses
+                cap = ok.length;
+                degraded = true;
+                return false;
             }
-            return true;
         }
     }
+
     // array type display name -> {count, totalBytes}
     final Map<String, long[]> arrayStats = new HashMap<String, long[]>();
 
@@ -351,7 +354,7 @@ public class HeapQuickScan {
             if ("--uncompressed-oops".equals(a)) { scanner.uncompressedOops = true; forceUncompressedF = true; }
         }
         if (wantsParents || (needsObject && Runtime.getRuntime().maxMemory() >= 3L * 1024 * 1024 * 1024)) {
-            long maxSlots = Math.min(1L << 29, Runtime.getRuntime().maxMemory() / 17L / 2);
+            long maxSlots = Math.min(1L << 30, Runtime.getRuntime().maxMemory() / 30L);
             scanner.parents = new ParentIndex(maxSlots);
         }
         try {
@@ -1316,6 +1319,13 @@ public class HeapQuickScan {
 
     /** Renders a root->target chain. Entry label "TARGET" marks the queried object. */
     void printChain(List<Object[]> chain) {
+        if (System.getenv("HQS_DEBUG") != null) {
+            for (int i = 0; i < chain.size(); i++) {
+                long id = (Long) chain.get(i)[0];
+                System.err.println("dbg chain[" + i + "] = 0x" + Long.toHexString(id)
+                        + " inRoots=" + roots.containsKey(id) + " label=" + chain.get(i)[1]);
+            }
+        }
         for (int i = 0; i < chain.size(); i++) {
             long id = (Long) chain.get(i)[0];
             String label = (String) chain.get(i)[1];
@@ -1337,116 +1347,138 @@ public class HeapQuickScan {
         }
     }
 
-    /** paths command: parent-index chain first (instant), BFS fallback per target. */
-    void reportPaths(File file, List<Long> targets, int maxDepth) throws IOException {
-        for (int i = 0; i < targets.size(); i++) {
-            if (i > 0) System.out.println();
-            reportOnePath(file, targets.get(i).longValue(), maxDepth);
+    /** One target of the paths command. */
+    static class PathSearch {
+        final long targetId;
+        String targetName = "";
+        Set<Long> frontier = new HashSet<Long>();
+        final Map<Long, Object[]> parent = new HashMap<Long, Object[]>(); // srcId -> {viaId, label}
+        Set<Long> next = new HashSet<Long>();
+        long foundRoot = -1;
+        boolean done;
+
+        PathSearch(long targetId) {
+            this.targetId = targetId;
+            this.frontier.add(targetId);
         }
     }
 
-    void reportOnePath(File file, long targetId, int maxDepth) throws IOException {
-        String targetName = prettyClassName(className(targetId, "object @" + Long.toHexString(targetId)));
-        Root targetRoot = roots.get(targetId);
-        if (targetRoot != null) {
-            System.out.println("Object " + targetName + " @0x" + Long.toHexString(targetId)
-                    + " is itself a GC root (" + rootType(targetRoot) + describeThreadRoot(targetRoot) + ").");
-            printRootStack(targetRoot);
-            return;
-        }
-
-        // Fast path: walk the first-referrer index (built with --parents / paths).
-        if (parents != null && !parents.degraded) {
-            List<Object[]> chain = new ArrayList<Object[]>(); // root->...->target, {id, label:""}
-            Set<Long> seen = new HashSet<Long>();
-            seen.add(targetId);
-            long cur = targetId;
-            boolean rooted = roots.containsKey(cur);
-            int steps = 0;
-            while (!rooted && steps++ < 100000) {
-                long p = parents.get(cur);
-                if (p == -1 || seen.contains(p)) break;   // unknown referrer or cycle
-                chain.add(new Object[]{p, "(reference)"});
-                seen.add(p);
-                cur = p;
-                rooted = roots.containsKey(cur);
+    /** paths command: parent-index chain first (instant), then a shared BFS sweep for the rest. */
+    void reportPaths(File file, List<Long> targets, int maxDepth) throws IOException {
+        List<PathSearch> pending = new ArrayList<PathSearch>();
+        for (int i = 0; i < targets.size(); i++) {
+            if (i > 0) System.out.println();
+            long t = targets.get(i).longValue();
+            String tName = prettyClassName(className(t, "object @" + Long.toHexString(t)));
+            Root targetRoot = roots.get(t);
+            if (targetRoot != null) {
+                System.out.println("Object " + tName + " @0x" + Long.toHexString(t)
+                        + " is itself a GC root (" + rootType(targetRoot) + describeThreadRoot(targetRoot) + ").");
+                printRootStack(targetRoot);
+                continue;
             }
-            if (rooted) {
-                Collections.reverse(chain);
-                chain.add(new Object[]{targetId, "TARGET"});
-                System.out.println("=== Path to GC root via first-referrer index (" + (chain.size() - 1) + " hops) ===");
-                System.out.println();
-                printChain(chain);
-                Root rr = roots.get(cur);
-                if (rr != null) {
-                    System.out.println();
-                    printRootStack(rr);
+            // Fast path: walk the first-referrer index (built with --parents / paths).
+            if (parents != null && !parents.degraded) {
+                List<Object[]> chain = new ArrayList<Object[]>(); // root->...->target, {id, label:""}
+                Set<Long> seen = new HashSet<Long>();
+                seen.add(t);
+                long cur = t;
+                boolean rooted = roots.containsKey(cur);
+                int steps = 0;
+                while (!rooted && steps++ < 100000) {
+                    long p = parents.get(cur);
+                    if (p == -1 || seen.contains(p)) break;   // unknown referrer or cycle
+                    chain.add(new Object[]{p, "(reference)"});
+                    seen.add(p);
+                    cur = p;
+                    rooted = roots.containsKey(cur);
                 }
-                return;
+                if (rooted) {
+                    Collections.reverse(chain);
+                    chain.add(new Object[]{t, "TARGET"});
+                    System.out.println("=== Path to GC root via first-referrer index (" + (chain.size() - 1) + " hops) ===");
+                    System.out.println();
+                    printChain(chain);
+                    Root rr = roots.get(cur);
+                    if (rr != null) {
+                        System.out.println();
+                        printRootStack(rr);
+                    }
+                    continue;
+                }
+                System.out.println("(first-referrer index has no rooted chain for 0x"
+                        + Long.toHexString(t) + "; falling back to BFS)");
             }
-            System.out.println("(first-referrer index has no rooted chain for this object; falling back to BFS)");
+            PathSearch ps = new PathSearch(t);
+            ps.targetName = tName;
+            pending.add(ps);
         }
 
-        Set<Long> frontier = new HashSet<Long>();
-        frontier.add(targetId);
-        Set<Long> visited = new HashSet<Long>();
-        visited.add(targetId);
-        Map<Long, Object[]> parent = new HashMap<Long, Object[]>(); // srcId -> {viaId, label}
-        long foundRoot = -1;
-        int depth = 0;
+        if (!pending.isEmpty()) {
+            bfsSweep(file, pending, maxDepth);
+        }
+    }
 
-        while (!frontier.isEmpty() && depth < maxDepth && foundRoot == -1) {
-            depth++;
-            final Set<Long> frontierF = frontier;
-            Set<Long> next = new HashSet<Long>();
-            final Set<Long> nextF = next;
+    /** Shared multi-target inbound BFS: one file pass per level for ALL targets. */
+    void bfsSweep(File file, List<PathSearch> active, int maxDepth) throws IOException {
+        Set<Long> globalVisited = new HashSet<Long>();
+        for (PathSearch s : active) globalVisited.add(s.targetId);
+
+        for (int depth = 1; depth <= maxDepth && !active.isEmpty(); depth++) {
+            final Set<Long> frontierUnion = new HashSet<Long>();
+            for (PathSearch s : active) frontierUnion.addAll(s.frontier);
+            final List<PathSearch> activeF = active;
+            final Set<Long> newVisited = new HashSet<Long>();
             boolean hit = walkRefs(file, new RefVisitor() {
-                private int added;
                 public boolean seeRef(long src, long dst, String label) {
-                    if (!frontierF.contains(dst)) return false;
-                    if (parent.containsKey(src) || visited.contains(src)) return false;
-                    parent.put(src, new Object[]{dst, label});
-                    visited.add(src);
-                    if (roots.containsKey(src)) return true;
-                    if (nextF.size() < 20000) nextF.add(src);
+                    if (!frontierUnion.contains(dst)) return false;
+                    for (PathSearch s : activeF) {
+                        if (s.done || !s.frontier.contains(dst) || s.parent.containsKey(src)) continue;
+                        s.parent.put(src, new Object[]{dst, label});
+                        if (roots.containsKey(src)) s.foundRoot = src;
+                        if (!globalVisited.contains(src) && s.next.size() < 20000) {
+                            s.next.add(src);
+                        }
+                    }
                     return false;
                 }
             });
-            if (hit) {
-                for (Long src : parent.keySet()) {
-                    if (roots.containsKey(src)) { foundRoot = src; break; }
+            List<PathSearch> stillActive = new ArrayList<PathSearch>();
+            for (PathSearch s : active) {
+                globalVisited.addAll(s.next);
+                if (s.foundRoot != -1) {
+                    s.done = true;
+                    System.out.println("=== Shortest path to GC root via inbound BFS (" + depth + " hops) ===");
+                    System.out.println();
+                    List<Object[]> chain = new ArrayList<Object[]>();
+                    long cur2 = s.foundRoot;
+                    while (cur2 != s.targetId) {
+                        Object[] p = s.parent.get(cur2);
+                        if (p == null) break;
+                        chain.add(new Object[]{cur2, p[1]});
+                        cur2 = (Long) p[0];
+                    }
+                    chain.add(new Object[]{s.targetId, "TARGET"});
+                    printChain(chain);
+                    System.out.println();
+                    Root r = roots.get(s.foundRoot);
+                    if (r != null) printRootStack(r);
+                } else if (!s.next.isEmpty()) {
+                    s.frontier = s.next;
+                    s.next = new HashSet<Long>();
+                    stillActive.add(s);
                 }
             }
-            frontier = next;
-            System.err.printf("  depth %d: frontier %d, visited %d%s%n",
-                    depth, frontier.size(), visited.size(), hit ? ", root reached" : "");
+            System.err.printf("  depth %d: active %d, global visited %d%s%n",
+                    depth, stillActive.size(), globalVisited.size(), hit ? ", root reached" : "");
+            active = stillActive;
         }
-
-        if (foundRoot == -1) {
-            System.out.println("No GC root reachable within " + maxDepth
-                    + " reference hops from " + targetName + " @0x" + Long.toHexString(targetId)
-                    + " (visited " + visited.size() + " referrers).");
-            return;
-        }
-
-        // Reconstruct root -> ... -> target (parent[src] = {viaId, label-of-edge-src->via})
-        List<Object[]> chain = new ArrayList<Object[]>();
-        long cur = foundRoot;
-        while (cur != targetId) {
-            Object[] p = parent.get(cur);
-            if (p == null) break;
-            chain.add(new Object[]{cur, p[1]});
-            cur = (Long) p[0];
-        }
-        chain.add(new Object[]{targetId, "TARGET"});
-
-        System.out.println("=== Shortest path to GC root via inbound BFS (" + depth + " hops) ===");
-        System.out.println();
-        printChain(chain);
-        Root r = roots.get(foundRoot);
-        if (r != null) {
-            System.out.println();
-            printRootStack(r);
+        for (PathSearch s : active) {
+            if (!s.done) {
+                System.out.println("No GC root reachable within " + maxDepth
+                        + " reference hops from " + s.targetName + " @0x"
+                        + Long.toHexString(s.targetId) + ".");
+            }
         }
     }
 
